@@ -2,3 +2,5 @@ streamlit
 google-genai
 python-dotenv
 requests
+pandas
+reportlab
