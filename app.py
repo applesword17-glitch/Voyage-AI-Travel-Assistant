@@ -11,6 +11,7 @@ import requests
 import streamlit as st
 from dotenv import load_dotenv
 from google import genai
+from google.genai import types
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
@@ -18,15 +19,27 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.units import cm
 
 load_dotenv()
+
+# First try local .env
 API_KEY = os.getenv("GOOGLE_API_KEY")
 MODEL = os.getenv("GOOGLE_MODEL", "gemini-3.6-flash")
+
+# If deployed on Streamlit Cloud, use Streamlit Secrets
+if not API_KEY:
+    try:
+        API_KEY = st.secrets["GOOGLE_API_KEY"]
+        MODEL = st.secrets.get("GOOGLE_MODEL", "gemini-3.6-flash")
+    except Exception:
+        pass
 
 st.set_page_config(page_title="Voyage | AI Travel Assistant", page_icon="✈️", layout="wide")
 
 if not API_KEY:
-    st.error("GOOGLE_API_KEY is missing. Put it in your .env file.")
+    st.error(
+        "GOOGLE_API_KEY is missing. "
+        "Add it to your local .env file or Streamlit Secrets."
+    )
     st.stop()
-
 st.markdown("""
 <style>
 .block-container {padding-top:1.2rem; padding-bottom:4rem; max-width:1200px;}
@@ -66,6 +79,46 @@ from verified/current data.
 Do not recommend alcohol, casinos/gambling, age-restricted nightlife, or unsafe activities.
 Offer age-appropriate alternatives such as night markets, cultural shows, cafés, viewpoints,
 or evening walks in busy public areas.
+BUDGET FEASIBILITY:
+
+Before generating any complete itinerary, perform a realistic feasibility check.
+
+The user's stated total budget must be treated as a hard constraint unless the
+user explicitly says otherwise.
+
+Use Google Search grounding when current travel costs materially affect feasibility.
+
+Consider:
+- international or domestic transport from the user's starting city
+- accommodation
+- local transport
+- food
+- activities / entry fees
+- taxes or common mandatory charges where relevant
+- a reasonable emergency / contingency buffer
+
+Clearly state whether the trip is:
+
+✅ REALISTIC WITHIN BUDGET
+⚠️ POSSIBLE ONLY WITH MAJOR COMPROMISES
+❌ NOT REALISTIC WITHIN BUDGET
+
+Do not force an itinerary to fit an unrealistic budget.
+
+If the trip is not realistic:
+1. Explain which categories make the budget unrealistic.
+2. Give a realistic approximate budget range based on grounded/current evidence.
+3. Suggest the smallest useful changes, such as:
+   - changing destination
+   - shortening the trip
+   - changing travel dates
+   - using cheaper accommodation
+   - increasing the budget
+4. Ask the user which alternative they prefer before finalizing the itinerary.
+
+Never claim that an international trip fits the user's budget merely because
+individual daily expenses look affordable. Include the cost of reaching the destination
+when an origin city has been supplied.
 
 Use clear Markdown headings and concise detail.
 """
@@ -85,26 +138,170 @@ def build_context():
     for m in history:
         text += f'{m["role"].upper()}: {m["content"]}\n\n'
     return text
+def add_grounding_citations(response):
+    """
+    Adds clickable citations from Google Search grounding
+    to the Gemini response text.
+    """
+    text = response.text
+
+    try:
+        metadata = response.candidates[0].grounding_metadata
+
+        if not metadata:
+            return text
+
+        supports = metadata.grounding_supports or []
+        chunks = metadata.grounding_chunks or []
+
+        # Insert citations from the end backwards so indexes don't shift
+        supports = sorted(
+            supports,
+            key=lambda s: s.segment.end_index if s.segment else 0,
+            reverse=True
+        )
+
+        for support in supports:
+
+            if not support.segment:
+                continue
+
+            end_index = support.segment.end_index
+
+            links = []
+
+            if support.grounding_chunk_indices:
+
+                for i in support.grounding_chunk_indices:
+
+                    if i < len(chunks):
+
+                        chunk = chunks[i]
+
+                        if chunk.web and chunk.web.uri:
+
+                            title = chunk.web.title or f"Source {i + 1}"
+
+                            links.append(
+                                f"[{i + 1}]({chunk.web.uri})"
+                            )
+
+            if links:
+
+                citation = " " + " ".join(links)
+
+                text = (
+                    text[:end_index]
+                    + citation
+                    + text[end_index:]
+                )
+
+    except Exception:
+        # If citation parsing ever fails, still show the AI answer
+        pass
+
+    return text
+
 
 def call_gemini(extra_instruction=None, retries=3):
+    """
+    Sends the current Voyage conversation to Gemini.
+
+    Features:
+    - Uses Google Search grounding
+    - Retries temporary 503 errors
+    - Handles quota / 429 errors gracefully
+    - Returns grounded citations through add_grounding_citations()
+    """
+
     prompt = build_context()
+
+    # Add any special instruction for this particular request
     if extra_instruction:
-        prompt += "\nTASK FOR THIS TURN:\n" + extra_instruction
+        prompt += (
+            "\n\nTASK FOR THIS TURN:\n"
+            + extra_instruction
+        )
+
     last_error = None
+
     for attempt in range(retries):
+
         try:
-            response = new_client().models.generate_content(model=MODEL, contents=prompt)
-            return response.text
+            # Create a fresh Gemini client for this request
+            client = genai.Client(
+                api_key=API_KEY
+            )
+
+            # Enable Google Search grounding
+            grounding_tool = types.Tool(
+                google_search=types.GoogleSearch()
+            )
+
+            config = types.GenerateContentConfig(
+                tools=[grounding_tool]
+            )
+
+            # Send request to Gemini
+            response = client.models.generate_content(
+                model=MODEL,
+                contents=prompt,
+                config=config
+            )
+
+            # Add source citations when grounding data is available
+            return add_grounding_citations(response)
+
         except Exception as e:
+
             last_error = e
             msg = str(e).lower()
-            if "503" in msg or "unavailable" in msg or "high demand" in msg:
+
+            # -----------------------------------------
+            # QUOTA / RATE LIMIT ERROR
+            # -----------------------------------------
+            if (
+                "429" in msg
+                or "resource_exhausted" in msg
+                or "quota" in msg
+            ):
+                return (
+                    "⚠️ **Voyage's AI service has temporarily "
+                    "reached its request limit.**\n\n"
+                    "Please try again later. Your trip details "
+                    "are still saved in Voyage."
+                )
+
+            # -----------------------------------------
+            # TEMPORARY GEMINI SERVER ERROR
+            # -----------------------------------------
+            if (
+                "503" in msg
+                or "unavailable" in msg
+                or "high demand" in msg
+            ):
+
+                # Wait slightly longer after each failed attempt
                 time.sleep(2 + attempt * 2)
+
                 continue
+
+            # -----------------------------------------
+            # CLOSED CLIENT ERROR
+            # -----------------------------------------
+            if "client has been closed" in msg:
+
+                # Try again with a fresh client
+                time.sleep(1)
+
+                continue
+
+            # Unknown error - show it instead of hiding it
             raise
+
+    # All retries failed
     raise last_error
 
-@st.cache_data(ttl=3600)
 def geocode_city(place):
     r = requests.get(
         "https://geocoding-api.open-meteo.com/v1/search",
@@ -141,36 +338,292 @@ def weather_code_text(code):
                81:"Rain showers",82:"Heavy showers",95:"Thunderstorms"}
     return mapping.get(code, "Mixed conditions")
 
+
 @st.cache_data(ttl=86400)
-def commons_images(query, limit=4):
-    if not query:
-        return []
-    params = {
-        "action":"query","generator":"search","gsrsearch":f"{query} travel landmark",
-        "gsrnamespace":6,"gsrlimit":max(limit*2,6),"prop":"imageinfo",
-        "iiprop":"url|extmetadata","iiurlwidth":1000,"format":"json","origin":"*",
-    }
+def best_commons_image(place):
+    """
+    Finds one useful photograph for one specific attraction/place
+    from Wikimedia Commons.
+
+    Filters out PDFs, maps, scans, SVGs and document-type results.
+    """
+
+    if not place:
+        return None
+
     try:
+        search_url = "https://commons.wikimedia.org/w/api.php"
+
+        # Search for the EXACT attraction rather than a whole country
+        search_params = {
+            "action": "query",
+            "list": "search",
+            "srsearch": f'"{place}"',
+            "srnamespace": 6,
+            "srlimit": 20,
+            "format": "json",
+            "origin": "*"
+        }
+
         r = requests.get(
-            "https://commons.wikimedia.org/w/api.php",
-            params=params, timeout=12,
-            headers={"User-Agent":"VoyageSchoolAIProject/1.0"}
+            search_url,
+            params=search_params,
+            timeout=12,
+            headers={
+                "User-Agent": "VoyageSchoolAIProject/1.0"
+            }
         )
+
         r.raise_for_status()
-        pages = r.json().get("query", {}).get("pages", {})
-        out = []
-        for p in pages.values():
-            info = (p.get("imageinfo") or [{}])[0]
-            img = info.get("thumburl") or info.get("url")
-            if img:
-                out.append({"url":img,"title":p.get("title","").replace("File:",""),
-                            "source":info.get("descriptionurl","")})
-            if len(out) >= limit:
-                break
-        return out
+
+        results = r.json().get(
+            "query", {}
+        ).get(
+            "search", []
+        )
+
+        # We only want normal image formats
+        allowed_extensions = (
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".webp"
+        )
+
+        # Reject obviously useless results
+        banned_words = [
+            "map",
+            "diagram",
+            "logo",
+            "flag",
+            "coat of arms",
+            "document",
+            "scan",
+            "book",
+            "pdf",
+            "chart",
+            "graph"
+        ]
+
+        candidates = []
+
+        for result in results:
+
+            title = result.get("title", "")
+
+            title_lower = title.lower()
+
+            # Must be an actual photograph/image
+            if not title_lower.endswith(
+                allowed_extensions
+            ):
+                continue
+
+            # Skip maps/documents/etc.
+            if any(
+                word in title_lower
+                for word in banned_words
+            ):
+                continue
+
+            candidates.append(title)
+
+        if not candidates:
+            return None
+
+        # Try the best few candidates
+        for title in candidates[:8]:
+
+            info_params = {
+                "action": "query",
+                "titles": title,
+                "prop": "imageinfo",
+                "iiprop": "url|extmetadata",
+                "iiurlwidth": 1200,
+                "format": "json",
+                "origin": "*"
+            }
+
+            info_response = requests.get(
+                search_url,
+                params=info_params,
+                timeout=12,
+                headers={
+                    "User-Agent":
+                    "VoyageSchoolAIProject/1.0"
+                }
+            )
+
+            info_response.raise_for_status()
+
+            pages = info_response.json().get(
+                "query", {}
+            ).get(
+                "pages", {}
+            )
+
+            for page in pages.values():
+
+                image_info = (
+                    page.get("imageinfo")
+                    or [{}]
+                )[0]
+
+                image_url = (
+                    image_info.get("thumburl")
+                    or image_info.get("url")
+                )
+
+                if image_url:
+
+                    return {
+                        "place": place,
+                        "url": image_url,
+                        "title": title.replace(
+                            "File:", ""
+                        ),
+                        "source":
+                            image_info.get(
+                                "descriptionurl",
+                                ""
+                            )
+                    }
+
     except Exception:
+        pass
+
+    return None
+def extract_photo_places():
+    """
+    Uses the latest itinerary to identify the most important
+    specific attractions that deserve photographs.
+    """
+
+    if not st.session_state.latest_plan:
         return []
 
+    prompt = f"""
+Read this travel itinerary:
+
+{st.session_state.latest_plan}
+
+Return ONLY a JSON list containing the names of the
+5 most important specific attractions or places that
+the traveller will actually visit.
+
+Rules:
+- Specific places only.
+- Do NOT return countries.
+- Do NOT return generic cities unless absolutely necessary.
+- Prefer landmarks, neighbourhoods, parks, palaces,
+  beaches, museums, towers, temples, lakes, etc.
+- Maximum 5 places.
+
+Example:
+
+[
+  "Gyeongbokgung Palace",
+  "Bukchon Hanok Village",
+  "N Seoul Tower",
+  "Myeongdong",
+  "Dongdaemun Design Plaza"
+]
+
+Return ONLY the JSON list.
+"""
+
+    try:
+
+        client = genai.Client(
+            api_key=API_KEY
+        )
+
+        response = client.models.generate_content(
+            model=MODEL,
+            contents=prompt
+        )
+
+        text = response.text.strip()
+
+        # Remove Markdown code fences if Gemini adds them
+        text = text.replace(
+            "```json", ""
+        ).replace(
+            "```", ""
+        ).strip()
+
+        places = json.loads(text)
+
+        if isinstance(places, list):
+            return places[:5]
+
+    except Exception:
+        pass
+
+    return []
+def extract_itinerary_cities():
+    """
+    Uses the latest itinerary to identify the main cities
+    or overnight bases where the traveller will stay.
+    """
+
+    if not st.session_state.latest_plan:
+        return []
+
+    prompt = f"""
+Read this travel itinerary:
+
+{st.session_state.latest_plan}
+
+Return ONLY a JSON list containing the main cities,
+towns, or overnight bases where the traveller actually
+spends significant time.
+
+Rules:
+- Return places in itinerary order.
+- Do not include individual attractions.
+- Do not include countries.
+- Do not include airports.
+- Do not repeat cities.
+- Maximum 6 places.
+
+Example:
+[
+  "Rome, Italy",
+  "Florence, Italy",
+  "Venice, Italy"
+]
+
+Return ONLY the JSON list.
+"""
+
+    try:
+        client = genai.Client(
+            api_key=API_KEY
+        )
+
+        response = client.models.generate_content(
+            model=MODEL,
+            contents=prompt
+        )
+
+        text = response.text.strip()
+
+        text = (
+            text.replace("```json", "")
+            .replace("```", "")
+            .strip()
+        )
+
+        cities = json.loads(text)
+
+        if isinstance(cities, list):
+            return cities[:6]
+
+    except Exception:
+        pass
+
+    return []
 def qp(s):
     return urllib.parse.quote_plus(str(s or ""))
 
@@ -241,6 +694,10 @@ def markdown_to_pdf_bytes(title, markdown_text):
     return buf.getvalue()
 
 if "messages" not in st.session_state: st.session_state.messages = []
+if "photo_places" not in st.session_state:
+    st.session_state.photo_places = []
+if "weather_cities" not in st.session_state:
+    st.session_state.weather_cities = []
 if "trip_profile" not in st.session_state: st.session_state.trip_profile = {}
 if "past_trips" not in st.session_state: st.session_state.past_trips = load_past_trips()
 if "latest_plan" not in st.session_state: st.session_state.latest_plan = ""
@@ -290,6 +747,8 @@ if reset_btn:
     st.session_state.messages = []
     st.session_state.trip_profile = {}
     st.session_state.latest_plan = ""
+    st.session_state.photo_places = []
+    st.session_state.weather_cities = []
     st.rerun()
 
 if start_btn:
@@ -313,11 +772,25 @@ if start_btn:
     with st.spinner("Voyage is designing your trip..."):
         try:
             answer = call_gemini(
-                "Create the first complete itinerary now. If destination is not decided, "
-                "recommend one best-fit destination first and build the itinerary for it. "
-                "Include budget, example stays, transport, packing, practical local information, "
-                "and responsible travel."
-            )
+      """
+      First perform a grounded budget-feasibility assessment using the user's
+      origin, destination, dates/season, travellers and total budget.
+
+      Search current web information when transport, accommodation,
+      entry fees, local passes or other current prices materially affect
+      the feasibility assessment.
+
+      If the trip is unrealistic within the budget, DO NOT generate a
+      fake budget-compliant itinerary. Explain the realistic problem and
+      offer 2-3 practical alternatives.
+
+      If the trip is realistically feasible, create the complete itinerary.
+
+      For factual or time-sensitive claims such as prices, travel rules,
+      transport passes, closures, visas, opening information or current
+      availability, prefer grounded information and include citations.
+      """
+      )
         except Exception as e:
             st.error(f"Gemini could not answer right now: {e}")
             st.stop()
@@ -379,50 +852,533 @@ with tab_plan:
                            use_container_width=True)
 
 with tab_weather:
+
+    st.subheader("🌦️ Weather Along Your Journey")
+
+    st.write(
+        "Voyage identifies the main cities in your itinerary "
+        "and shows the weather for each stop."
+    )
+
     if not profile:
-        st.info("Create a trip first.")
+
+        st.info(
+            "Create an itinerary first."
+        )
+
     else:
-        city = st.text_input("City for weather",
-                             value=profile.get("destination","") if profile.get("destination")!="not decided" else "")
-        if city:
-            try:
-                forecast = live_forecast(city)
-            except Exception as e:
-                forecast = None
-                st.warning(f"Weather service unavailable: {e}")
-            if forecast:
-                loc = forecast["location"]; daily = forecast["daily"]
-                st.write(f"**Live forecast near {loc.get('name')}, {loc.get('country','')}**")
-                rows = []
-                for i,d in enumerate(daily.get("time",[])):
-                    rows.append({
-                        "Date":d,
-                        "Conditions":weather_code_text(daily.get("weather_code",[None])[i]),
-                        "Min °C":daily.get("temperature_2m_min",[None])[i],
-                        "Max °C":daily.get("temperature_2m_max",[None])[i],
-                        "Rain chance %":daily.get("precipitation_probability_max",[None])[i],
-                    })
-                st.dataframe(rows, use_container_width=True, hide_index=True)
-                st.caption("Exact forecast is only available within the live forecast window. Later dates should be treated as seasonal estimates.")
+
+        # ----------------------------------------
+        # IDENTIFY ITINERARY CITIES
+        # ----------------------------------------
+
+        if st.button(
+            "✨ Load weather for my itinerary",
+            use_container_width=True
+        ):
+
+            with st.spinner(
+                "Finding the cities in your journey..."
+            ):
+
+                cities = extract_itinerary_cities()
+
+                st.session_state.weather_cities = cities
+
+        cities = st.session_state.get(
+            "weather_cities",
+            []
+        )
+
+        # ----------------------------------------
+        # WEATHER FOR EACH CITY
+        # ----------------------------------------
+
+        if cities:
+
+            st.caption(
+                "Weather shown below is live forecast data "
+                "where available."
+            )
+
+            for city in cities:
+
+                st.markdown("---")
+
+                st.markdown(
+                    f"## 📍 {city}"
+                )
+
+                try:
+
+                    forecast = live_forecast(
+                        city
+                    )
+
+                except Exception as e:
+
+                    forecast = None
+
+                    st.warning(
+                        f"Weather service unavailable "
+                        f"for {city}."
+                    )
+
+                if forecast:
+
+                    loc = forecast[
+                        "location"
+                    ]
+
+                    daily = forecast[
+                        "daily"
+                    ]
+
+                    dates = daily.get(
+                        "time", []
+                    )
+
+                    codes = daily.get(
+                        "weather_code", []
+                    )
+
+                    max_temps = daily.get(
+                        "temperature_2m_max", []
+                    )
+
+                    min_temps = daily.get(
+                        "temperature_2m_min", []
+                    )
+
+                    rain = daily.get(
+                        "precipitation_probability_max",
+                        []
+                    )
+
+                    if dates:
+
+                        # --------------------------------
+                        # FIRST-DAY WEATHER SUMMARY
+                        # --------------------------------
+
+                        condition = (
+                            weather_code_text(
+                                codes[0]
+                            )
+                            if codes
+                            else "Unknown"
+                        )
+
+                        max_temp = (
+                            max_temps[0]
+                            if max_temps
+                            else "—"
+                        )
+
+                        min_temp = (
+                            min_temps[0]
+                            if min_temps
+                            else "—"
+                        )
+
+                        rain_chance = (
+                            rain[0]
+                            if rain
+                            else "—"
+                        )
+
+                        col1, col2, col3, col4 = (
+                            st.columns(4)
+                        )
+
+                        col1.metric(
+                            "Conditions",
+                            condition
+                        )
+
+                        col2.metric(
+                            "High",
+                            f"{max_temp} °C"
+                        )
+
+                        col3.metric(
+                            "Low",
+                            f"{min_temp} °C"
+                        )
+
+                        col4.metric(
+                            "Rain chance",
+                            f"{rain_chance}%"
+                        )
+
+                        # --------------------------------
+                        # UPCOMING FORECAST
+                        # --------------------------------
+
+                        st.markdown(
+                            "#### 📅 Upcoming forecast"
+                        )
+
+                        rows = []
+
+                        for i, d in enumerate(
+                            dates[:7]
+                        ):
+
+                            rows.append(
+                                {
+                                    "Date": d,
+
+                                    "Weather":
+                                        weather_code_text(
+                                            codes[i]
+                                        )
+                                        if i < len(codes)
+                                        else "—",
+
+                                    "Low °C":
+                                        min_temps[i]
+                                        if i < len(
+                                            min_temps
+                                        )
+                                        else "—",
+
+                                    "High °C":
+                                        max_temps[i]
+                                        if i < len(
+                                            max_temps
+                                        )
+                                        else "—",
+
+                                    "Rain %":
+                                        rain[i]
+                                        if i < len(
+                                            rain
+                                        )
+                                        else "—"
+                                }
+                            )
+
+                        st.dataframe(
+                            rows,
+                            use_container_width=True,
+                            hide_index=True
+                        )
+
+                        # --------------------------------
+                        # AI-FREE PACKING ADVICE
+                        # --------------------------------
+
+                        tips = []
+
+                        if (
+                            isinstance(
+                                rain_chance,
+                                (int, float)
+                            )
+                            and rain_chance >= 40
+                        ):
+
+                            tips.append(
+                                "☔ Carry a compact "
+                                "umbrella or rain jacket."
+                            )
+
+                        if (
+                            isinstance(
+                                max_temp,
+                                (int, float)
+                            )
+                            and max_temp >= 30
+                        ):
+
+                            tips.append(
+                                "☀️ Expect warm conditions — "
+                                "carry water, sunscreen and "
+                                "light clothing."
+                            )
+
+                        if (
+                            isinstance(
+                                min_temp,
+                                (int, float)
+                            )
+                            and min_temp <= 10
+                        ):
+
+                            tips.append(
+                                "🧥 Pack a warm layer for "
+                                "cool mornings or evenings."
+                            )
+
+                        if tips:
+
+                            st.markdown(
+                                "#### 🎒 Weather tips"
+                            )
+
+                            for tip in tips:
+
+                                st.write(tip)
+
+                else:
+
+                    st.warning(
+                        f"No weather data found "
+                        f"for {city}."
+                    )
+
+        else:
+
+            st.info(
+                "Click **Load weather for my itinerary** "
+                "to automatically detect your trip's cities."
+            )
+
+        # ----------------------------------------
+        # MANUAL WEATHER LOOKUP
+        # ----------------------------------------
+
+        st.divider()
+
+        with st.expander(
+            "🔎 Check another city"
+        ):
+
+            manual_city = st.text_input(
+                "City name",
+                placeholder="e.g. Milan, Italy",
+                key="manual_weather_city"
+            )
+
+            if manual_city:
+
+                try:
+
+                    manual_forecast = (
+                        live_forecast(
+                            manual_city
+                        )
+                    )
+
+                except Exception:
+
+                    manual_forecast = None
+
+                if manual_forecast:
+
+                    daily = manual_forecast[
+                        "daily"
+                    ]
+
+                    rows = []
+
+                    for i, d in enumerate(
+                        daily.get(
+                            "time", []
+                        )[:7]
+                    ):
+
+                        rows.append(
+                            {
+                                "Date": d,
+
+                                "Weather":
+                                    weather_code_text(
+                                        daily.get(
+                                            "weather_code",
+                                            []
+                                        )[i]
+                                    ),
+
+                                "Low °C":
+                                    daily.get(
+                                        "temperature_2m_min",
+                                        []
+                                    )[i],
+
+                                "High °C":
+                                    daily.get(
+                                        "temperature_2m_max",
+                                        []
+                                    )[i],
+
+                                "Rain %":
+                                    daily.get(
+                                        "precipitation_probability_max",
+                                        []
+                                    )[i]
+                            }
+                        )
+
+                    st.dataframe(
+                        rows,
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                else:
+
+                    st.warning(
+                        "Weather information "
+                        "couldn't be found."
+                    )
 
 with tab_photos:
+
+    st.subheader(
+        "📸 Photos of Recommended Places"
+    )
+
+    st.write(
+        "Voyage selects the main attractions from "
+        "your itinerary and finds a labelled image "
+        "for each place."
+    )
+
     if not profile:
-        st.info("Create a trip first.")
+
+        st.info(
+            "Create an itinerary first."
+        )
+
     else:
-        photo_place = st.text_input("Place or attraction",
-                                    value=profile.get("destination","") if profile.get("destination")!="not decided" else "",
-                                    placeholder="e.g. Lake Como, Colosseum, Kyoto")
-        if photo_place:
-            imgs = commons_images(photo_place, 4)
-            if imgs:
+
+        # ----------------------------------------
+        # AUTOMATIC ITINERARY GALLERY
+        # ----------------------------------------
+
+        if st.button(
+            "✨ Show photos from my itinerary",
+            use_container_width=True
+        ):
+
+            with st.spinner(
+                "Finding the places in your itinerary..."
+            ):
+
+                places = extract_photo_places()
+
+                st.session_state.photo_places = places
+
+        places = st.session_state.get(
+            "photo_places",
+            []
+        )
+
+        if places:
+
+            st.caption(
+                "These are the main places Voyage "
+                "identified in your itinerary."
+            )
+
+            # Display two cards per row
+            for i in range(
+                0,
+                len(places),
+                2
+            ):
+
                 cols = st.columns(2)
-                for i,img in enumerate(imgs):
-                    with cols[i%2]:
-                        st.image(img["url"], caption=img["title"], use_container_width=True)
-                        if img["source"]:
-                            st.link_button("Image source / license", img["source"])
+
+                for j in range(2):
+
+                    index = i + j
+
+                    if index >= len(places):
+                        break
+
+                    place = places[index]
+
+                    with cols[j]:
+
+                        st.markdown(
+                            f"### 📍 {place}"
+                        )
+
+                        with st.spinner(
+                            f"Finding photo of {place}..."
+                        ):
+
+                            image = (
+                                best_commons_image(
+                                    place
+                                )
+                            )
+
+                        if image:
+
+                            st.image(
+                                image["url"],
+                                caption=place,
+                                use_container_width=True
+                            )
+
+                            if image["source"]:
+
+                                st.link_button(
+                                    "Image source / licence",
+                                    image["source"],
+                                    use_container_width=True
+                                )
+
+                        else:
+
+                            st.info(
+                                "No suitable photograph "
+                                "was found automatically."
+                            )
+
+        # ----------------------------------------
+        # MANUAL PLACE SEARCH
+        # ----------------------------------------
+
+        st.divider()
+
+        st.subheader(
+            "🔎 Search another place"
+        )
+
+        manual_place = st.text_input(
+            "Specific attraction",
+            placeholder=(
+                "e.g. Gyeongbokgung Palace"
+            )
+        )
+
+        if manual_place:
+
+            image = best_commons_image(
+                manual_place
+            )
+
+            if image:
+
+                st.markdown(
+                    f"### 📍 {manual_place}"
+                )
+
+                st.image(
+                    image["url"],
+                    caption=manual_place,
+                    use_container_width=True
+                )
+
+                if image["source"]:
+
+                    st.link_button(
+                        "Image source / licence",
+                        image["source"]
+                    )
+
             else:
-                st.warning("No suitable Wikimedia Commons photos were found.")
+
+                st.warning(
+                    "I couldn't find a suitable "
+                    "photograph for that exact place."
+                )
+ 
 
 with tab_memory:
     st.write("Save a short summary of a trip you liked or disliked. Voyage can use it for future recommendations on this computer.")
