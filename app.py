@@ -3,11 +3,17 @@ import io
 import json
 import time
 import re
+import logging
+import html
+import hashlib
+import math
 import urllib.parse
 from datetime import date, datetime
 from pathlib import Path
+from collections import defaultdict
 
 import requests
+import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 from google import genai
@@ -17,6 +23,8 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.units import cm
+from reportlab.lib import colors
+from reportlab.platypus import Table, TableStyle
 
 load_dotenv()
 
@@ -35,19 +43,32 @@ if not API_KEY:
 st.set_page_config(page_title="Voyage | AI Travel Assistant", page_icon="✈️", layout="wide")
 
 if not API_KEY:
-    st.error(
-        "GOOGLE_API_KEY is missing. "
-        "Add it to your local .env file or Streamlit Secrets."
-    )
-    st.stop()
+    st.info("Gemini is not configured yet. You can preview the interface and use non-AI tools; add GOOGLE_API_KEY in Streamlit Secrets when ready.")
+# CSS uses Streamlit theme variables, so both light and dark mode stay readable.
 st.markdown("""
 <style>
-.block-container {padding-top:1.2rem; padding-bottom:4rem; max-width:1200px;}
-.hero {padding:1.4rem 1.6rem;border-radius:22px;background:linear-gradient(135deg,#eef6ff,#f8f3ff);border:1px solid rgba(0,0,0,.06);margin-bottom:1rem;}
-.hero h1{margin:0 0 .25rem 0}.hero p{margin:0;opacity:.78}
-.pill{display:inline-block;padding:.25rem .65rem;margin:.12rem;border-radius:999px;border:1px solid rgba(0,0,0,.12);font-size:.86rem}
+:root { --voyage-accent: #3987e8; }
+.block-container { padding-top: 1.3rem; padding-bottom: 3.5rem; max-width: 1200px; }
+.hero { padding: 1.6rem 1.8rem; border-radius: 22px;
+  background: linear-gradient(120deg, color-mix(in srgb, var(--primary-color, #3987e8) 13%, var(--secondary-background-color, #f5f7fb)), var(--secondary-background-color, #f5f7fb));
+  border: 1px solid color-mix(in srgb, var(--text-color, #222) 12%, transparent);
+  color: var(--text-color, #222); margin-bottom: 1rem; }
+.hero h1 { margin: 0 0 .25rem 0; color: inherit; }
+.hero p { margin: 0; opacity: .85; color: inherit; }
+.voyage-card { background: var(--secondary-background-color, #f5f7fb);
+  border: 1px solid color-mix(in srgb, var(--text-color, #222) 12%, transparent);
+  border-radius: 16px; padding: 1rem 1.2rem; margin: .55rem 0; color: var(--text-color, #222); }
+.voyage-card h3 { margin-top: 0; color: inherit; }
+.pill { display: inline-block; padding: .25rem .65rem; margin: .12rem;
+  border-radius: 999px; border: 1px solid color-mix(in srgb, var(--text-color, #222) 22%, transparent);
+  color: var(--text-color, #222); font-size: .86rem; }
+[data-testid="stSidebar"] { border-right: 1px solid color-mix(in srgb, var(--text-color, #222) 9%, transparent); }
+@media(max-width: 640px) { .block-container { padding: 1rem .8rem 2rem; }
+  .hero { padding: 1.15rem; border-radius: 15px; } .hero h1 { font-size: 1.75rem; } }
 </style>
 """, unsafe_allow_html=True)
+
+LOGGER = logging.getLogger("voyage")
 
 SYSTEM_PROMPT = """
 You are Voyage, an AI travel-planning assistant.
@@ -203,7 +224,7 @@ def add_grounding_citations(response):
     return text
 
 
-def call_gemini(extra_instruction=None, retries=3):
+def call_gemini(extra_instruction=None, retries=2):
     """
     Sends the current Voyage conversation to Gemini.
 
@@ -214,6 +235,8 @@ def call_gemini(extra_instruction=None, retries=3):
     - Returns grounded citations through add_grounding_citations()
     """
 
+    if not API_KEY:
+        raise RuntimeError("Gemini API key is not configured")
     prompt = build_context()
 
     # Add any special instruction for this particular request
@@ -250,12 +273,18 @@ def call_gemini(extra_instruction=None, retries=3):
             )
 
             # Add source citations when grounding data is available
-            return add_grounding_citations(response)
+            result = add_grounding_citations(response)
+            if not result or not result.strip():
+                raise RuntimeError("Gemini returned an empty response")
+            return result
 
         except Exception as e:
 
             last_error = e
             msg = str(e).lower()
+            # Do not log raw errors: they may include request details or sensitive data.
+            LOGGER.warning("Gemini request failed: type=%s status=%s attempt=%s", type(e).__name__,
+                           next((c for c in ("429", "503", "401", "403", "404") if c in msg), "unknown"), attempt + 1)
 
             # -----------------------------------------
             # QUOTA / RATE LIMIT ERROR
@@ -265,12 +294,7 @@ def call_gemini(extra_instruction=None, retries=3):
                 or "resource_exhausted" in msg
                 or "quota" in msg
             ):
-                return (
-                    "⚠️ **Voyage's AI service has temporarily "
-                    "reached its request limit.**\n\n"
-                    "Please try again later. Your trip details "
-                    "are still saved in Voyage."
-                )
+                raise RuntimeError("Voyage AI quota/rate limit reached (429). Check project quota and model access.") from None
 
             # -----------------------------------------
             # TEMPORARY GEMINI SERVER ERROR
@@ -296,11 +320,11 @@ def call_gemini(extra_instruction=None, retries=3):
 
                 continue
 
-            # Unknown error - show it instead of hiding it
-            raise
+            # Keep detailed provider errors out of the public app.
+            raise RuntimeError(f"Gemini request failed ({type(e).__name__}). Check private app logs.") from None
 
     # All retries failed
-    raise last_error
+    raise RuntimeError("Gemini is temporarily unavailable after retries. Please try later.") from None
 
 def geocode_city(place):
     r = requests.get(
@@ -494,136 +518,23 @@ def best_commons_image(place):
 
     return None
 def extract_photo_places():
-    """
-    Uses the latest itinerary to identify the most important
-    specific attractions that deserve photographs.
-    """
+    """No additional Gemini request: find named places in the existing plan."""
+    plan = st.session_state.get("latest_plan", "")
+    matches = re.findall(r"(?:^|\n)\s*(?:[-*]\s*)?(?:Visit|Explore|See|Stop at|Discover)\s+([A-Z][^\n,.;:]{3,55})", plan, re.I)
+    matches += re.findall(r"\*\*([^*\n]{5,55})\*\*", plan)
+    banned = ("morning", "afternoon", "evening", "budget", "day ", "total", "transport", "hotel", "meal")
+    return list(dict.fromkeys(x.strip(" -:0123456789") for x in matches
+        if not any(w in x.lower() for w in banned)))[:5]
 
-    if not st.session_state.latest_plan:
-        return []
 
-    prompt = f"""
-Read this travel itinerary:
-
-{st.session_state.latest_plan}
-
-Return ONLY a JSON list containing the names of the
-5 most important specific attractions or places that
-the traveller will actually visit.
-
-Rules:
-- Specific places only.
-- Do NOT return countries.
-- Do NOT return generic cities unless absolutely necessary.
-- Prefer landmarks, neighbourhoods, parks, palaces,
-  beaches, museums, towers, temples, lakes, etc.
-- Maximum 5 places.
-
-Example:
-
-[
-  "Gyeongbokgung Palace",
-  "Bukchon Hanok Village",
-  "N Seoul Tower",
-  "Myeongdong",
-  "Dongdaemun Design Plaza"
-]
-
-Return ONLY the JSON list.
-"""
-
-    try:
-
-        client = genai.Client(
-            api_key=API_KEY
-        )
-
-        response = client.models.generate_content(
-            model=MODEL,
-            contents=prompt
-        )
-
-        text = response.text.strip()
-
-        # Remove Markdown code fences if Gemini adds them
-        text = text.replace(
-            "```json", ""
-        ).replace(
-            "```", ""
-        ).strip()
-
-        places = json.loads(text)
-
-        if isinstance(places, list):
-            return places[:5]
-
-    except Exception:
-        pass
-
-    return []
 def extract_itinerary_cities():
-    """
-    Uses the latest itinerary to identify the main cities
-    or overnight bases where the traveller will stay.
-    """
-
-    if not st.session_state.latest_plan:
-        return []
-
-    prompt = f"""
-Read this travel itinerary:
-
-{st.session_state.latest_plan}
-
-Return ONLY a JSON list containing the main cities,
-towns, or overnight bases where the traveller actually
-spends significant time.
-
-Rules:
-- Return places in itinerary order.
-- Do not include individual attractions.
-- Do not include countries.
-- Do not include airports.
-- Do not repeat cities.
-- Maximum 6 places.
-
-Example:
-[
-  "Rome, Italy",
-  "Florence, Italy",
-  "Venice, Italy"
-]
-
-Return ONLY the JSON list.
-"""
-
-    try:
-        client = genai.Client(
-            api_key=API_KEY
-        )
-
-        response = client.models.generate_content(
-            model=MODEL,
-            contents=prompt
-        )
-
-        text = response.text.strip()
-
-        text = (
-            text.replace("```json", "")
-            .replace("```", "")
-            .strip()
-        )
-
-        cities = json.loads(text)
-
-        if isinstance(cities, list):
-            return cities[:6]
-
-    except Exception:
-        pass
-
+    """No additional Gemini request; prefer known destination and manually entered bases."""
+    profile = st.session_state.get("trip_profile", {})
+    destination = profile.get("destination", "")
+    if destination and destination != "not decided":
+        return [destination]
     return []
+
 def qp(s):
     return urllib.parse.quote_plus(str(s or ""))
 
@@ -647,22 +558,14 @@ def booking_link(destination, checkin, checkout):
 def maps_search_link(query):
     return "https://www.google.com/maps/search/?api=1&query=" + qp(query)
 
-MEMORY_FILE = Path("voyage_trips.json")
-
 def load_past_trips():
-    try:
-        if MEMORY_FILE.exists():
-            data = json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
-            return data if isinstance(data, list) else []
-    except Exception:
-        pass
+    """Session-only memories: never share a server-side JSON file across users."""
     return []
 
+
 def save_past_trips(trips):
-    try:
-        MEMORY_FILE.write_text(json.dumps(trips, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+    """No server persistence. Users may download/import their own JSON."""
+    return None
 
 def markdown_to_pdf_bytes(title, markdown_text):
     buf = io.BytesIO()
@@ -692,6 +595,63 @@ def markdown_to_pdf_bytes(title, markdown_text):
     doc.build(story)
     buf.seek(0)
     return buf.getvalue()
+
+def parse_budget(profile):
+    raw = str(profile.get("budget", ""))
+    currency = raw.split(" ")[0] if " " in raw else "INR"
+    try:
+        amount = float(re.sub(r"[^0-9.]", "", raw))
+    except ValueError:
+        amount = 0
+    return currency, amount
+
+
+def budget_allocations(profile):
+    """Illustrative allocation only; NOT current quotes or Gemini-derived prices."""
+    currency, amount = parse_budget(profile)
+    weights = {"Long-distance travel": .30, "Stay": .28, "Food": .16,
+               "Local transport": .10, "Activities": .09, "Contingency": .07}
+    return currency, {k: round(amount * v) for k, v in weights.items()}
+
+
+def packing_suggestions(profile):
+    season = str(profile.get("season", "") or "").lower()
+    interests = " ".join(profile.get("interests", [])).lower()
+    items = ["Travel documents / ID", "Tickets and booking confirmations",
+             "Phone and charger", "Personal medication and essentials",
+             "Comfortable shoes", "Reusable water bottle", "Weather-appropriate clothes"]
+    if "winter" in season or "mountain" in interests:
+        items += ["Warm layers", "Warm socks"]
+    if "monsoon" in season:
+        items += ["Rain jacket or umbrella"]
+    if "beach" in interests or "summer" in season:
+        items += ["Sun protection", "Hat"]
+    if "adventure" in interests:
+        items += ["Suitable activity footwear"]
+    return list(dict.fromkeys(items))
+
+
+def show_itinerary_cards(text):
+    """Render day headings as readable collapsible sections; raw Markdown fallback."""
+    parts = re.split(r"(?im)^(?=\s{0,3}#{0,3}\s*\*{0,2}day\s+\d+\b)", text)
+    days = [p for p in parts if re.match(r"(?im)^\s{0,3}#{0,3}\s*\*{0,2}day\s+\d+\b", p)]
+    if len(days) < 2:
+        st.markdown(text)
+        return
+    intro = parts[0]
+    if intro.strip(): st.markdown(intro)
+    for part in days:
+        heading = part.strip().splitlines()[0].strip(" #*")
+        with st.expander(heading, expanded=False):
+            st.markdown(part)
+
+
+def safe_error_display(e):
+    msg = str(e)
+    if "quota" in msg.lower() or "429" in msg:
+        st.warning("Voyage AI is currently rate-limited. Your trip setup is preserved. Check the API project's quota.")
+    else:
+        st.error("Voyage AI is unavailable right now. Check the app's private logs for the error category.")
 
 if "messages" not in st.session_state: st.session_state.messages = []
 if "photo_places" not in st.session_state:
@@ -792,11 +752,14 @@ if start_btn:
       """
       )
         except Exception as e:
-            st.error(f"Gemini could not answer right now: {e}")
-            st.stop()
-    st.session_state.messages = [{"role":"assistant","content":answer}]
-    st.session_state.latest_plan = answer
-    st.rerun()
+            safe_error_display(e)
+            answer = None
+    if answer:
+        st.session_state.messages = [{"role":"assistant","content":answer}]
+        st.session_state.latest_plan = answer
+        st.session_state.photo_places = []
+        st.session_state.weather_cities = []
+        st.rerun()
 
 profile = st.session_state.trip_profile
 
@@ -820,15 +783,21 @@ if profile:
         b3.link_button("Search hotels", booking_link(dest,depart,ret), use_container_width=True)
         b4.link_button("Open map", maps_search_link(dest), use_container_width=True)
 
-tab_plan, tab_weather, tab_photos, tab_memory = st.tabs(["💬 Plan & Chat","🌦️ Weather","🖼️ Photos","🧠 Trip Memory"])
+tab_plan, tab_weather, tab_photos, tab_memory, tab_tools = st.tabs(
+    ["💬 Plan & Chat", "🌦️ Weather", "🖼️ Photos", "🧠 Trip Memory", "🗺️ Trip Tools"]
+)
 
 with tab_plan:
     if not st.session_state.messages:
         st.info("Set preferences in the sidebar and click **Build my trip**.")
     else:
+        card_view = st.toggle("Day-wise itinerary cards", value=False, key="card_view")
         for message in st.session_state.messages:
             with st.chat_message(message["role"], avatar="✈️" if message["role"]=="assistant" else None):
-                st.markdown(message["content"])
+                if card_view and message["role"] == "assistant":
+                    show_itinerary_cards(message["content"])
+                else:
+                    st.markdown(message["content"])
 
     user_message = st.chat_input("Ask Voyage to refine, compare, explain, or change your trip...")
     if user_message:
@@ -837,11 +806,12 @@ with tab_plan:
             try:
                 answer = call_gemini()
             except Exception as e:
-                st.error(f"Gemini could not answer right now: {e}")
-                st.stop()
-        st.session_state.messages.append({"role":"assistant","content":answer})
-        st.session_state.latest_plan = answer
-        st.rerun()
+                safe_error_display(e)
+                answer = None
+        if answer:
+            st.session_state.messages.append({"role":"assistant","content":answer})
+            st.session_state.latest_plan = answer
+            st.rerun()
 
     if st.session_state.latest_plan:
         st.divider()
@@ -856,8 +826,8 @@ with tab_weather:
     st.subheader("🌦️ Weather Along Your Journey")
 
     st.write(
-        "Voyage identifies the main cities in your itinerary "
-        "and shows the weather for each stop."
+        "Voyage shows near-term forecasts for your destinations. "
+        "For travel beyond the forecast window, use seasonal guidance instead of treating today's forecast as your travel-day weather."
     )
 
     if not profile:
@@ -889,6 +859,12 @@ with tab_weather:
             "weather_cities",
             []
         )
+        city_override = st.text_area("Trip cities / overnight bases (one city per line)",
+            value="\n".join(cities), key="weather_city_override",
+            help="Enter each city on a separate line (e.g. Rome, Italy); no AI request.")
+        if city_override.strip():
+            cities = [x.strip() for x in city_override.splitlines() if x.strip()][:6]
+
 
         # ----------------------------------------
         # WEATHER FOR EACH CITY
@@ -898,7 +874,7 @@ with tab_weather:
 
             st.caption(
                 "Weather shown below is live forecast data "
-                "where available."
+                "where available. Forecasts cover the next 14 days, NOT distant travel dates."
             )
 
             for city in cities:
@@ -1265,6 +1241,12 @@ with tab_photos:
             "photo_places",
             []
         )
+        place_override = st.text_area("Attractions for photos (one place per line)",
+            value="\n".join(places), key="photo_place_override",
+            help="Enter attractions directly to avoid extra AI requests.")
+        if place_override.strip():
+            places = [x.strip() for x in place_override.splitlines() if x.strip()][:5]
+
 
         if places:
 
@@ -1381,7 +1363,19 @@ with tab_photos:
  
 
 with tab_memory:
-    st.write("Save a short summary of a trip you liked or disliked. Voyage can use it for future recommendations on this computer.")
+    st.write("Trip memories stay in your current browser session. Download your private JSON backup to keep them between sessions; they are NOT saved to a shared server file.")
+    upload_mem = st.file_uploader("Import your trip memories (JSON)", type=["json"], key="memory_import")
+    if upload_mem is not None and st.button("Import memories"):
+        try:
+            data = json.loads(upload_mem.getvalue().decode("utf-8"))
+            if not isinstance(data, list) or len(data) > 100 or not all(isinstance(x, dict) for x in data):
+                raise ValueError("Invalid memory format")
+            st.session_state.past_trips = [{"trip": str(x.get("trip", ""))[:100],
+                "preferences": str(x.get("preferences", ""))[:1000],
+                "saved_at": str(x.get("saved_at", ""))[:30]} for x in data]
+            st.success("Imported into this session.")
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            st.error("Please upload a valid Voyage memory JSON file.")
     memory_name = st.text_input("Trip name", placeholder="e.g. Manali winter trip")
     memory_likes = st.text_area("What did you like/dislike?",
                                 placeholder="Loved mountain views and cafés; disliked rushed sightseeing.")
@@ -1395,6 +1389,12 @@ with tab_memory:
         else:
             st.warning("Add both fields.")
     if st.session_state.past_trips:
+        st.download_button("⬇️ Download my private trip memories", 
+            json.dumps(st.session_state.past_trips, ensure_ascii=False, indent=2),
+            file_name="my_voyage_memories.json", mime="application/json")
+        if st.button("Clear my trip memories"):
+            st.session_state.past_trips = []
+            st.rerun()
         st.subheader("Saved memories")
         for item in reversed(st.session_state.past_trips[-8:]):
             st.markdown(f"**{item.get('trip','Trip')}** — {item.get('preferences','')}")
@@ -1403,3 +1403,47 @@ with tab_memory:
 
 st.divider()
 st.caption("Voyage is an AI planning prototype. Verify prices, availability, travel rules, closures and long-range weather before booking.")
+
+with tab_tools:
+    st.subheader("🗺️ Trip Tools")
+    if not profile:
+        st.info("Set up a trip first to use the budget, packing, and map tools.")
+    else:
+        st.markdown("### 💰 Budget allocation")
+        st.caption("Illustrative percentage-based planning allocation only — not live prices or a guarantee of affordability. Check real transport and accommodation quotes before booking.")
+        currency, allocation = budget_allocations(profile)
+        st.bar_chart(pd.DataFrame({"Category": list(allocation), "Amount": list(allocation.values())}).set_index("Category"), horizontal=True)
+        for category, value in allocation.items():
+            st.write(f"**{category}:** {currency} {value:,}")
+        st.divider()
+        st.markdown("### 🎒 Packing checklist")
+        st.caption("General suggestions based on your trip profile; check local rules and actual travel-date weather.")
+        for item in packing_suggestions(profile):
+            st.checkbox(item, key="pack_" + hashlib.sha256(item.encode()).hexdigest()[:12])
+        st.divider()
+        st.markdown("### 📍 Interactive map")
+        st.caption("Enter coordinates for trip stops to see them on an interactive OpenStreetMap-backed map. No paid map API or Gemini request required.")
+        st.caption("Format: Place name, latitude, longitude — one place per line. Coordinates can be copied from a map listing.")
+        map_text = st.text_area("Map stops", placeholder="Eiffel Tower, 48.8584, 2.2945\nLouvre Museum, 48.8606, 2.3376", key="map_stops")
+        markers = []
+        if map_text.strip():
+            for line in map_text.splitlines()[:25]:
+                fields = [v.strip() for v in line.rsplit(",", 2)]
+                if len(fields) != 3:
+                    st.warning(f"Invalid map row: {line[:70]}")
+                    continue
+                try:
+                    lat, lon = float(fields[1]), float(fields[2])
+                    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                        raise ValueError()
+                    markers.append({"name": fields[0][:80], "lat": lat, "lon": lon})
+                except ValueError:
+                    st.warning(f"Invalid coordinates: {line[:70]}")
+            if markers:
+                st.map(markers, latitude="lat", longitude="lon", size=120)
+                for m in markers:
+                    st.link_button("📍 " + m["name"], maps_search_link(m["name"]))
+        else:
+            dest = profile.get("destination", "")
+            if dest and dest != "not decided":
+                st.link_button("Find places in Google Maps", maps_search_link(dest))
