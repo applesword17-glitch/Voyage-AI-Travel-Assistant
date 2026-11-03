@@ -1,6 +1,7 @@
-streamlit
-google-genai
-python-dotenv
-requests
-pandas
-reportlab
+
+streamlit>=1.40
+google-genai>=1.0
+python-dotenv>=1.0
+requests>=2.31
+reportlab>=4.0
+pandas>=2.0
