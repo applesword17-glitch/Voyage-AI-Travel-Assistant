@@ -256,7 +256,7 @@ def call_gemini(extra_instruction=None, retries=2):
             # Generate the response
             response = client.models.generate_content(
                 model=MODEL,
-                contents="Reply with exactly: Voyage connected",
+                contents=prompt,
                 config=config
             )
 
