@@ -224,112 +224,119 @@ def add_grounding_citations(response):
     return text
 
 
+
 def call_gemini(extra_instruction=None, retries=2):
     """
     Sends the current Voyage conversation to Gemini.
 
     Features:
-    - Uses Google Search grounding
+    - Temporarily disables Google Search grounding
     - Retries temporary 503 errors
-    - Handles quota / 429 errors gracefully
-    - Returns grounded citations through add_grounding_citations()
+    - Handles quota / 429 errors
+    - Logs safe diagnostic information
+    - Returns generated itinerary text
     """
 
     if not API_KEY:
         raise RuntimeError("Gemini API key is not configured")
+
     prompt = build_context()
 
-    # Add any special instruction for this particular request
     if extra_instruction:
-        prompt += (
-            "\n\nTASK FOR THIS TURN:\n"
-            + extra_instruction
-        )
-
-    last_error = None
+        prompt += "\n\nTASK FOR THIS TURN:\n" + extra_instruction
 
     for attempt in range(retries):
-
         try:
-            # Create a fresh Gemini client for this request
-            client = genai.Client(
-                api_key=API_KEY
-            )
+            # Create a fresh Gemini client
+            client = genai.Client(api_key=API_KEY)
 
-           # Temporarily disable Google Search grounding
-           # to diagnose the Gemini 429 error.
+            # Google Search grounding temporarily disabled
             config = types.GenerateContentConfig()
 
-            # Send request to Gemini
+            # Generate the response
             response = client.models.generate_content(
                 model=MODEL,
                 contents=prompt,
                 config=config
             )
 
-            # Add source citations when grounding data is available
-            result = add_grounding_citations(response)
+            # Extract response text
+            result = response.text
+
             if not result or not result.strip():
                 raise RuntimeError("Gemini returned an empty response")
-            return result
+
+            return result.strip()
 
         except Exception as e:
-
-            last_error = e
             msg = str(e).lower()
-            # Do not log raw errors: they may include request details or sensitive data.
-            LOGGER.warning("Gemini request failed: type=%s status=%s attempt=%s", type(e).__name__,
-                           next((c for c in ("429", "503", "401", "403", "404") if c in msg), "unknown"), attempt + 1)
+            error_type = type(e).__name__
 
-            # -----------------------------------------
-            # QUOTA / RATE LIMIT ERROR
-            # -----------------------------------------
+            # Log the error category without exposing
+            # API keys or sensitive request details
+            status = next(
+                (
+                    code
+                    for code in ("429", "503", "401", "403", "404")
+                    if code in msg
+                ),
+                "unknown"
+            )
+
+            LOGGER.warning(
+                "Gemini request failed: type=%s status=%s attempt=%s",
+                error_type,
+                status,
+                attempt + 1
+            )
+
+            # Handle quota / rate-limit errors
             if (
                 "429" in msg
                 or "resource_exhausted" in msg
                 or "quota" in msg
             ):
-                raise RuntimeError("Voyage AI quota/rate limit reached (429). Check project quota and model access.") from None
+                raise RuntimeError(
+                    "Voyage AI quota/rate limit reached (429). "
+                    "Check project quota and model access."
+                ) from None
 
-            # -----------------------------------------
-            # TEMPORARY GEMINI SERVER ERROR
-            # -----------------------------------------
+            # Retry temporary server errors
             if (
                 "503" in msg
                 or "unavailable" in msg
                 or "high demand" in msg
             ):
+                if attempt < retries - 1:
+                    time.sleep(2 + attempt * 2)
+                    continue
 
-                # Wait slightly longer after each failed attempt
-                time.sleep(2 + attempt * 2)
+                raise RuntimeError(
+                    "Gemini is temporarily unavailable (503)."
+                ) from None
 
-                continue
-
-            # -----------------------------------------
-            # CLOSED CLIENT ERROR
-            # -----------------------------------------
+            # Retry closed-client errors
             if "client has been closed" in msg:
+                if attempt < retries - 1:
+                    time.sleep(1)
+                    continue
 
-                # Try again with a fresh client
-                time.sleep(1)
+            # Log safe details for local RuntimeErrors
+            if isinstance(e, RuntimeError):
+                LOGGER.error(
+                    "Gemini diagnostic: %s",
+                    str(e)
+                )
 
-                continue
-
-            # Log a safe diagnostic message
-            LOGGER.error(
-                "Gemini diagnostic: exception_type=%s message=%s",
-                type(e).__name__,
-                str(e) if isinstance(e, RuntimeError) else "Provider error details withheld"
-            )
-
-            # Keep detailed errors out of the public app
+            # Handle other errors
             raise RuntimeError(
-                f"Gemini request failed ({type(e).__name__}). Check private app logs."
+                f"Gemini request failed ({error_type}). "
+                "Check private app logs."
             ) from None
 
-
-    # All retries failed
-    raise RuntimeError("Gemini is temporarily unavailable after retries. Please try later.") from None
+    raise RuntimeError(
+        "Gemini is temporarily unavailable after retries."
+    ) from None
 
 def geocode_city(place):
     r = requests.get(
