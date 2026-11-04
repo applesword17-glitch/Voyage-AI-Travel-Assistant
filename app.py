@@ -256,14 +256,9 @@ def call_gemini(extra_instruction=None, retries=2):
                 api_key=API_KEY
             )
 
-            # Enable Google Search grounding
-            grounding_tool = types.Tool(
-                google_search=types.GoogleSearch()
-            )
-
-            config = types.GenerateContentConfig(
-                tools=[grounding_tool]
-            )
+           # Temporarily disable Google Search grounding
+           # to diagnose the Gemini 429 error.
+            config = types.GenerateContentConfig()
 
             # Send request to Gemini
             response = client.models.generate_content(
