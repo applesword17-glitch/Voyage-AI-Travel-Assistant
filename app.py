@@ -263,9 +263,30 @@ def call_gemini(extra_instruction=None, retries=2):
             # Extract response text
             result = response.text
 
+            # Diagnose empty Gemini responses
             if not result or not result.strip():
+                candidates = getattr(response, "candidates", None) or []
+
+                finish_reasons = [
+                    str(getattr(candidate, "finish_reason", "unknown"))
+                    for candidate in candidates
+                ]
+
+                usage = getattr(response, "usage_metadata", None)
+
+                LOGGER.warning(
+                    "Gemini empty response: finish_reasons=%s "
+                    "prompt_tokens=%s output_tokens=%s thinking_tokens=%s",
+                    finish_reasons,
+                    getattr(usage, "prompt_token_count", None),
+                    getattr(usage, "candidates_token_count", None),
+                    getattr(usage, "thoughts_token_count", None)
+                )
+
                 raise RuntimeError("Gemini returned an empty response")
 
+
+            
             return result.strip()
 
         except Exception as e:
