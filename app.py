@@ -424,6 +424,11 @@ def best_commons_image(place):
             ):
                 continue
 
+            # Avoid unrelated images returned by a broad Commons search.
+            words = [w for w in re.findall(r"[a-zA-Z]{4,}", place.lower())
+                     if w not in {"the", "near", "with", "from", "city"}]
+            if words and not any(w in title_lower for w in words):
+                continue
             candidates.append(title)
 
         if not candidates:
@@ -492,13 +497,43 @@ def best_commons_image(place):
 
     return None
 def extract_photo_places():
-    """No additional Gemini request: find named places in the existing plan."""
+    """Extract likely attractions, never generic itinerary section headings."""
     plan = st.session_state.get("latest_plan", "")
-    matches = re.findall(r"(?:^|\n)\s*(?:[-*]\s*)?(?:Visit|Explore|See|Stop at|Discover)\s+([A-Z][^\n,.;:]{3,55})", plan, re.I)
-    matches += re.findall(r"\*\*([^*\n]{5,55})\*\*", plan)
-    banned = ("morning", "afternoon", "evening", "budget", "day ", "total", "transport", "hotel", "meal")
-    return list(dict.fromkeys(x.strip(" -:0123456789") for x in matches
-        if not any(w in x.lower() for w in banned)))[:5]
+    destination = st.session_state.get("trip_profile", {}).get("destination", "")
+    matches = re.findall(
+        r"(?im)^\s*(?:[-*]\s*)?(?:Visit|Explore|See|Stop at|Discover|Tour)\s+"
+        r"(?:the\s+)?([A-Z][^\n,.;:]{3,65})", plan
+    )
+    banned = ("analysis", "trip title", "trip mood", "morning", "afternoon",
+              "evening", "budget", "day ", "transport", "hotel", "meal",
+              "packing", "feasibility", "itinerary", "summary", "total")
+    places = []
+    for item in matches:
+        name = re.sub(r"\s+", " ", item).strip(" -*#.:!")
+        if name and not any(word in name.lower() for word in banned):
+            if name not in places:
+                places.append(name)
+    # When attraction names cannot be extracted reliably, show the destination
+    # rather than misleading pictures for generic headings.
+    if not places and destination and destination.lower() != "not decided":
+        places = [destination]
+    return places[:5]
+
+
+def show_commons_photo(image, place):
+    """Use ordinary HTML images to avoid Streamlit's failing ImageList JS chunk."""
+    if not image:
+        st.info("No matching photograph found. Try entering a specific attraction.")
+        return
+    url = html.escape(image["url"], quote=True)
+    alt = html.escape(place, quote=True)
+    st.markdown(
+        f'<img src="{url}" alt="{alt}" loading="lazy" '
+        'style="width:100%;max-height:310px;object-fit:cover;border-radius:12px;" />',
+        unsafe_allow_html=True,
+    )
+    if image.get("source"):
+        st.link_button("Image source / licence", image["source"], use_container_width=True)
 
 
 def extract_itinerary_cities():
@@ -612,17 +647,25 @@ def display_plan_markdown(content):
 
 
 def show_itinerary_cards(text):
-    """Render day headings as readable collapsible sections; raw Markdown fallback."""
-    parts = re.split(r"(?im)^(?=\s{0,3}#{0,3}\s*\*{0,2}day\s+\d+\b)", text)
-    days = [p for p in parts if re.match(r"(?im)^\s{0,3}#{0,3}\s*\*{0,2}day\s+\d+\b", p)]
-    if len(days) < 2:
+    """Recognize common Gemini day headings and show expandable day sections."""
+    # Supports: ## Day 1, **Day 1**, ### **Day 1: Jaipur**, 1. Day 1
+    pattern = re.compile(
+        r"(?im)^\s*(?:#{1,6}\s*)?(?:\d+[.)]\s*)?"
+        r"(?:\*\*|__)?\s*Day\s+\d+\b[^\n]*"
+    )
+    matches = list(pattern.finditer(str(text)))
+    if not matches:
         display_plan_markdown(text)
+        st.caption("Day-wise sections appear when the itinerary includes Day 1, Day 2, etc.")
         return
-    intro = parts[0]
-    if intro.strip(): display_plan_markdown(intro)
-    for part in days:
-        heading = part.strip().splitlines()[0].strip(" #*")
-        with st.expander(heading, expanded=False):
+    intro = text[:matches[0].start()]
+    if intro.strip():
+        display_plan_markdown(intro)
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        part = text[match.start():end]
+        heading = re.sub(r"[*_#]", "", match.group()).strip()
+        with st.expander(heading, expanded=(index == 0)):
             display_plan_markdown(part)
 
 
@@ -1205,6 +1248,7 @@ with tab_photos:
                 places = extract_photo_places()
 
                 st.session_state.photo_places = places
+                st.session_state["photo_place_override"] = "\n".join(places)
 
         places = st.session_state.get(
             "photo_places",
@@ -1259,20 +1303,7 @@ with tab_photos:
                             )
 
                         if image:
-
-                            st.image(
-                                image["url"],
-                                caption=place,
-                                use_container_width=True
-                            )
-
-                            if image["source"]:
-
-                                st.link_button(
-                                    "Image source / licence",
-                                    image["source"],
-                                    use_container_width=True
-                                )
+                            show_commons_photo(image, place)
 
                         else:
 
@@ -1305,23 +1336,8 @@ with tab_photos:
             )
 
             if image:
-
-                st.markdown(
-                    f"### 📍 {manual_place}"
-                )
-
-                st.image(
-                    image["url"],
-                    caption=manual_place,
-                    use_container_width=True
-                )
-
-                if image["source"]:
-
-                    st.link_button(
-                        "Image source / licence",
-                        image["source"]
-                    )
+                st.markdown(f"### 📍 {manual_place}")
+                show_commons_photo(image, manual_place)
 
             else:
 
