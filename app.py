@@ -107,8 +107,9 @@ Before generating any complete itinerary, perform a realistic feasibility check.
 The user's stated total budget must be treated as a hard constraint unless the
 user explicitly says otherwise.
 
-Use Google Search grounding when current travel costs materially affect feasibility.
-
+Use reasonable approximate travel costs based on available knowledge.
+Do not attempt to call external tools or functions.
+If current prices cannot be verified, clearly label them as estimates.
 Consider:
 - international or domestic transport from the user's starting city
 - accommodation
@@ -251,7 +252,10 @@ def call_gemini(extra_instruction=None, retries=2):
             client = genai.Client(api_key=API_KEY)
 
             # Google Search grounding temporarily disabled
-            config = types.GenerateContentConfig()
+            config = types.GenerateContentConfig(
+                     response_mime_type="text/plain",
+                     automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                     disable=True))
 
             # Generate the response
             response = client.models.generate_content(
