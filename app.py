@@ -315,17 +315,16 @@ def call_gemini(extra_instruction=None, retries=2):
 
                 continue
 
-            # Keep detailed provider errors out of the public app.
-            # Log the error category and a safe diagnostic message.
-            LOGGER.error(
-           "Gemini diagnostic: exception_type=%s message=%s",
-            type(e).__name__,
-            str(e) if isinstance(e, RuntimeError) else "Provider error details withheld"
-            )
+           # Log the error category and a safe diagnostic message.
+LOGGER.error(
+    "Gemini diagnostic: exception_type=%s message=%s",
+    type(e).__name__,
+    str(e) if isinstance(e, RuntimeError) else "Provider error details withheld"
+)
 
-           raise RuntimeError(
-           f"Gemini request failed ({type(e).__name__}). Check private app logs."
-           ) from None
+raise RuntimeError(
+    f"Gemini request failed ({type(e).__name__}). Check private app logs."
+) from None
 
     # All retries failed
     raise RuntimeError("Gemini is temporarily unavailable after retries. Please try later.") from None
