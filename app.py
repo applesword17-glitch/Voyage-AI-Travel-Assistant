@@ -497,27 +497,40 @@ def best_commons_image(place):
 
     return None
 def extract_photo_places():
-    """Extract likely attractions, never generic itinerary section headings."""
+    """Extract clean attraction names from the generated itinerary without AI calls."""
     plan = st.session_state.get("latest_plan", "")
     destination = st.session_state.get("trip_profile", {}).get("destination", "")
-    matches = re.findall(
-        r"(?im)^\s*(?:[-*]\s*)?(?:Visit|Explore|See|Stop at|Discover|Tour)\s+"
-        r"(?:the\s+)?([A-Z][^\n,.;:]{3,65})", plan
+    # Look for attractions mentioned after an activity verb, including bold names.
+    pattern = (
+        r"(?im)\b(?:visit|explore|see|discover|tour|stop at|head to|walk around)\s+"
+        r"(?:the\s+)?(?:\*\*)?([A-Z][A-Za-z0-9 &'’\-]{2,55}?)"
+        r"(?:\*\*|\s*\(|[,.;:\n]|$)"
     )
-    banned = ("analysis", "trip title", "trip mood", "morning", "afternoon",
-              "evening", "budget", "day ", "transport", "hotel", "meal",
-              "packing", "feasibility", "itinerary", "summary", "total")
+    matches = re.findall(pattern, plan)
+    # Also capture bold attraction names, but only those resembling named places.
+    matches.extend(re.findall(r"\*\*([A-Z][A-Za-z0-9 &'’\-]{3,50})\*\*", plan))
+    banned = {"analysis", "trip title", "trip mood", "morning", "afternoon",
+              "evening", "budget", "transport", "hotel", "meal", "packing",
+              "feasibility", "itinerary", "summary", "total", "day", "food",
+              "activities", "accommodation", "important notes", "trip overview"}
     places = []
     for item in matches:
-        name = re.sub(r"\s+", " ", item).strip(" -*#.:!")
-        if name and not any(word in name.lower() for word in banned):
-            if name not in places:
-                places.append(name)
-    # When attraction names cannot be extracted reliably, show the destination
-    # rather than misleading pictures for generic headings.
+        name = re.sub(r"\*|[`#]", "", item)
+        name = re.split(r"\s*\(|\s+[–—]\s+", name, maxsplit=1)[0]
+        name = re.sub(r"\s+", " ", name).strip(" -*#.:!,")
+        if not name or len(name) > 55 or len(name.split()) > 7:
+            continue
+        if name.lower() in banned or re.match(r"(?i)^day\s+\d+", name):
+            continue
+        if any(x in name.lower() for x in ("realistic within", "possible only", "not realistic")):
+            continue
+        if name.casefold() not in {x.casefold() for x in places}:
+            places.append(name)
+        if len(places) == 5:
+            break
     if not places and destination and destination.lower() != "not decided":
         places = [destination]
-    return places[:5]
+    return places
 
 
 def show_commons_photo(image, place):
