@@ -226,142 +226,79 @@ def add_grounding_citations(response):
 
 
 
-def call_gemini(extra_instruction=None, retries=2):
-    """
-    Sends the current Voyage conversation to Gemini.
-
-    Features:
-    - Temporarily disables Google Search grounding
-    - Retries temporary 503 errors
-    - Handles quota / 429 errors
-    - Logs safe diagnostic information
-    - Returns generated itinerary text
-    """
-
+def call_gemini(extra_instruction=None, retries=4):
+    """Generate a plain-text itinerary; retry temporary server failures safely."""
     if not API_KEY:
         raise RuntimeError("Gemini API key is not configured")
 
     prompt = build_context()
-
     if extra_instruction:
         prompt += "\n\nTASK FOR THIS TURN:\n" + extra_instruction
 
+    config = types.GenerateContentConfig(
+        response_mime_type="text/plain",
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+    )
+
     for attempt in range(retries):
         try:
-            # Create a fresh Gemini client
             client = genai.Client(api_key=API_KEY)
-
-            # Google Search grounding temporarily disabled
-            config = types.GenerateContentConfig(
-                     response_mime_type="text/plain",
-                     automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                     disable=True))
-
-            # Generate the response
-            response = client.models.generate_content(
-                model=MODEL,
-                contents=prompt,
-                config=config
-            )
-
-            # Extract response text
-            result = response.text
-
-            # Diagnose empty Gemini responses
-            if not result or not result.strip():
-                candidates = getattr(response, "candidates", None) or []
-
-                finish_reasons = [
-                    str(getattr(candidate, "finish_reason", "unknown"))
-                    for candidate in candidates
-                ]
-
-                usage = getattr(response, "usage_metadata", None)
-
-                LOGGER.warning(
-                    "Gemini empty response: finish_reasons=%s "
-                    "prompt_tokens=%s output_tokens=%s thinking_tokens=%s",
-                    finish_reasons,
-                    getattr(usage, "prompt_token_count", None),
-                    getattr(usage, "candidates_token_count", None),
-                    getattr(usage, "thoughts_token_count", None)
+            try:
+                response = client.models.generate_content(
+                    model=MODEL,
+                    contents=prompt,
+                    config=config,
                 )
+            finally:
+                client.close()
 
-                raise RuntimeError("Gemini returned an empty response")
+            result = response.text or ""
+            if result.strip():
+                return result.strip()
 
+            candidates = getattr(response, "candidates", None) or []
+            reasons = [str(getattr(c, "finish_reason", "unknown")) for c in candidates]
+            LOGGER.warning("Gemini empty response: finish_reasons=%s", reasons)
+            # A malformed tool call is not a valid text itinerary; retry once.
+            if attempt < retries - 1 and any("MALFORMED_FUNCTION_CALL" in x for x in reasons):
+                time.sleep(2)
+                continue
+            raise RuntimeError("Gemini returned an empty response")
 
-            
-            return result.strip()
-
-        except Exception as e:
-            msg = str(e).lower()
-            error_type = type(e).__name__
-
-            # Log the error category without exposing
-            # API keys or sensitive request details
-            status = next(
-                (
-                    code
-                    for code in ("429", "503", "401", "403", "404")
-                    if code in msg
-                ),
-                "unknown"
-            )
-
+        except Exception as exc:
+            message = str(exc).lower()
+            error_name = type(exc).__name__
+            transient = any(term in message for term in (
+                "503", "unavailable", "high demand", "502", "504",
+                "timeout", "timed out", "client has been closed",
+            ))
+            rate_limited = any(term in message for term in (
+                "429", "resource_exhausted", "quota",
+            ))
+            status = "429" if rate_limited else "503" if transient else "other"
             LOGGER.warning(
                 "Gemini request failed: type=%s status=%s attempt=%s",
-                error_type,
-                status,
-                attempt + 1
+                error_name, status, attempt + 1,
             )
 
-            # Handle quota / rate-limit errors
-            if (
-                "429" in msg
-                or "resource_exhausted" in msg
-                or "quota" in msg
-            ):
+            if rate_limited:
                 raise RuntimeError(
-                    "Voyage AI quota/rate limit reached (429). "
-                    "Check project quota and model access."
+                    "Gemini rate limit reached. Please try later; your saved plan is still available."
                 ) from None
-
-            # Retry temporary server errors
-            if (
-                "503" in msg
-                or "unavailable" in msg
-                or "high demand" in msg
-            ):
-                if attempt < retries - 1:
-                    time.sleep(2 + attempt * 2)
-                    continue
-
+            if transient and attempt < retries - 1:
+                time.sleep(min(5 * (attempt + 1), 15))
+                continue
+            if transient:
                 raise RuntimeError(
-                    "Gemini is temporarily unavailable (503)."
+                    "Gemini is temporarily busy after multiple attempts."
                 ) from None
-
-            # Retry closed-client errors
-            if "client has been closed" in msg:
-                if attempt < retries - 1:
-                    time.sleep(1)
-                    continue
-
-            # Log safe details for local RuntimeErrors
-            if isinstance(e, RuntimeError):
-                LOGGER.error(
-                    "Gemini diagnostic: %s",
-                    str(e)
-                )
-
-            # Handle other errors
+            if isinstance(exc, RuntimeError):
+                raise RuntimeError(str(exc)) from None
             raise RuntimeError(
-                f"Gemini request failed ({error_type}). "
-                "Check private app logs."
+                f"Gemini request failed ({error_name}); check private logs."
             ) from None
 
-    raise RuntimeError(
-        "Gemini is temporarily unavailable after retries."
-    ) from None
+    raise RuntimeError("Gemini is temporarily unavailable after retries")
 
 def geocode_city(place):
     r = requests.get(
@@ -668,19 +605,25 @@ def packing_suggestions(profile):
     return list(dict.fromkeys(items))
 
 
+def display_plan_markdown(content):
+    """Show itinerary prose without Streamlit's optional code-highlighter widget."""
+    clean = re.sub(r"(?m)^\s*```[^\n]*$", "", str(content))
+    st.markdown(clean)
+
+
 def show_itinerary_cards(text):
     """Render day headings as readable collapsible sections; raw Markdown fallback."""
     parts = re.split(r"(?im)^(?=\s{0,3}#{0,3}\s*\*{0,2}day\s+\d+\b)", text)
     days = [p for p in parts if re.match(r"(?im)^\s{0,3}#{0,3}\s*\*{0,2}day\s+\d+\b", p)]
     if len(days) < 2:
-        st.markdown(text)
+        display_plan_markdown(text)
         return
     intro = parts[0]
-    if intro.strip(): st.markdown(intro)
+    if intro.strip(): display_plan_markdown(intro)
     for part in days:
         heading = part.strip().splitlines()[0].strip(" #*")
         with st.expander(heading, expanded=False):
-            st.markdown(part)
+            display_plan_markdown(part)
 
 
 def safe_error_display(e):
@@ -688,7 +631,7 @@ def safe_error_display(e):
     if "quota" in msg.lower() or "429" in msg:
         st.warning("Voyage AI is currently rate-limited. Your trip setup is preserved. Check the API project's quota.")
     else:
-        st.error("Voyage AI is unavailable right now. Check the app's private logs for the error category.")
+        st.error("Voyage AI is temporarily unavailable. Your last successful itinerary, if any, is preserved below.")
 
 if "messages" not in st.session_state: st.session_state.messages = []
 if "photo_places" not in st.session_state:
@@ -769,25 +712,14 @@ if start_btn:
     with st.spinner("Voyage is designing your trip..."):
         try:
             answer = call_gemini(
-      """
-      First perform a grounded budget-feasibility assessment using the user's
-      origin, destination, dates/season, travellers and total budget.
-
-      Search current web information when transport, accommodation,
-      entry fees, local passes or other current prices materially affect
-      the feasibility assessment.
-
-      If the trip is unrealistic within the budget, DO NOT generate a
-      fake budget-compliant itinerary. Explain the realistic problem and
-      offer 2-3 practical alternatives.
-
-      If the trip is realistically feasible, create the complete itinerary.
-
-      For factual or time-sensitive claims such as prices, travel rules,
-      transport passes, closures, visas, opening information or current
-      availability, prefer grounded information and include citations.
-      """
-      )
+                "First assess whether the total budget realistically covers travel "
+                "from the starting city, accommodation, meals, local transport, "
+                "activities and contingency for every traveller. Use estimates, "
+                "not live quotes. Do not call tools or claim live verification. "
+                "If the budget is unrealistic, explain why and suggest alternatives "
+                "rather than inventing a feasible trip. Otherwise provide a "
+                "complete day-by-day itinerary with practical details."
+            )
         except Exception as e:
             safe_error_display(e)
             answer = None
@@ -834,7 +766,7 @@ with tab_plan:
                 if card_view and message["role"] == "assistant":
                     show_itinerary_cards(message["content"])
                 else:
-                    st.markdown(message["content"])
+                    display_plan_markdown(message["content"])
 
     user_message = st.chat_input("Ask Voyage to refine, compare, explain, or change your trip...")
     if user_message:
@@ -1449,9 +1381,10 @@ with tab_tools:
         st.markdown("### 💰 Budget allocation")
         st.caption("Illustrative percentage-based planning allocation only — not live prices or a guarantee of affordability. Check real transport and accommodation quotes before booking.")
         currency, allocation = budget_allocations(profile)
-        st.bar_chart(pd.DataFrame({"Category": list(allocation), "Amount": list(allocation.values())}).set_index("Category"), horizontal=True)
+        total_allocated = max(sum(allocation.values()), 1)
         for category, value in allocation.items():
             st.write(f"**{category}:** {currency} {value:,}")
+            st.progress(min(max(value / total_allocated, 0.0), 1.0))
         st.divider()
         st.markdown("### 🎒 Packing checklist")
         st.caption("General suggestions based on your trip profile; check local rules and actual travel-date weather.")
